@@ -9,15 +9,16 @@ import lab.header.PraosCertificateState.Point
 import lab.network.ChainSync
 import scala.concurrent.duration.*
 
-/** Test-only network pull adapter. No preloaded block list, reconnect, or public admission. */
-private[lab] object NativeLiveBoundary:
+/** Bounded research network pull adapter. No preloaded block list, reconnect, or public admission.
+  */
+private[lab] object PlutusSameEpochFollow:
   type Observation = NetworkPublicationObservation
-  val Observation = NetworkPublicationObservation
+  private val Observation = NetworkPublicationObservation
   final case class Outcome(
       snapshot: CoherentSequence.Snapshot,
       driver: Option[EphemeralStreaming.Report],
       reason: String,
-      boundaryReached: Boolean,
+      inclusionReached: Boolean,
       observations: Vector[Observation],
       networkEvents: Long,
       networkBytes: Long,
@@ -37,15 +38,6 @@ private[lab] object NativeLiveBoundary:
     * Resource allocation/intersection share the same deadline as network follow. External
     * cancellation propagates; peer release is guaranteed by Resource.
     */
-  def run[F[_]: Async](
-      runtime: CoherentDriver[F],
-      peer: Resource[F, BoundedChainFollower.Peer[F]],
-      initial: Point,
-      epochLength: BigInt,
-      limits: EphemeralStreaming.Limits = EphemeralStreaming.Limits()
-  )(record: Observation => F[Unit]): F[Outcome] =
-    runWhen(runtime, peer, initial, epochLength, limits)(Async[F].pure(true))(record)
-
   /** Additional completion condition is observed only after a verified network publication. */
   def runWhen[F[_]: Async](
       runtime: CoherentDriver[F],
@@ -70,8 +62,9 @@ private[lab] object NativeLiveBoundary:
         before.state.certificates.state.tip == initial &&
           before.state.acquisition.tip == networkPoint(initial) &&
           before.state.ledger.environment.epoch == 0 &&
-          before.state.syntheticBoundary.exists(!_.boundaryApplied)
-      )(new IllegalArgumentException("runtime does not match initial boundary state"))
+          before.state.syntheticBoundary.isEmpty && before.state.syntheticRewards.isEmpty &&
+          before.state.stake.nonEmpty && before.state.ledger.environment.plutus.nonEmpty
+      )(new IllegalArgumentException("runtime does not match initial same-epoch Plutus state"))
       started <- F.monotonic
       observations <- Ref.of[F, Vector[Observation]](Vector.empty)
       events <- Ref.of[F, Long](0L)
@@ -107,16 +100,16 @@ private[lab] object NativeLiveBoundary:
             observeApplication *> (runtime.snapshot, ready).tupled.flatMap {
               (snapshot, completed) =>
                 val state = snapshot.state
-                if completed && state.ledger.environment.epoch == 1 &&
-                  state.syntheticBoundary.exists(_.boundaryApplied) &&
-                  state.certificates.state.tip.slot / epochLength == 1
+                if completed && state.ledger.environment.epoch == 0 &&
+                  state.syntheticBoundary.isEmpty &&
+                  state.certificates.state.tip.slot / epochLength == 0
                 then
                   observations.get.flatMap { xs =>
                     if xs.lastOption.exists(o =>
                         o.applied.nonEmpty && o.announced == state.certificates.state.tip
                       )
                     then reached.set(true).as(None)
-                    else invalid("epoch boundary has no published network observation").as(None)
+                    else invalid("inclusion has no published network observation").as(None)
                   }
                 else
                   events
@@ -158,10 +151,10 @@ private[lab] object NativeLiveBoundary:
                           previous = state.certificates.state.tip
                           _ <- F.raiseUnless(
                             header.parent == previous.hash && header.slot > previous.slot &&
-                              header.blockNo == previous.blockNo + 1
+                              header.blockNo == previous.blockNo + 1 && header.slot < epochLength
                           )(
                             new IllegalArgumentException(
-                              "announcement does not extend applied fullpoint"
+                              "announcement does not extend applied fullpoint within initial epoch"
                             )
                           )
                           announced = Point(header.hash, header.slot, header.blockNo)
@@ -226,7 +219,7 @@ private[lab] object NativeLiveBoundary:
           if e.isInstanceOf[java.util.concurrent.TimeoutException] then "deadline"
           else s"failure:${e.getMessage}",
         r =>
-          if hit && r.stop == EphemeralStreaming.Stop.End then "boundaryApplied"
+          if hit && r.stop == EphemeralStreaming.Stop.End then "inclusionApplied"
           else r.stop.toString
       )
     yield Outcome(
